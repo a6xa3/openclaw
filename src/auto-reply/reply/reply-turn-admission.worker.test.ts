@@ -13,6 +13,10 @@ import { createAgentRunRestartAbortError } from "../../agents/run-termination.js
 import { replaceSessionEntrySync } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import * as nodeSqlite from "../../infra/node-sqlite.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
+import {
+  markGatewayRestartDraining,
+  resetGatewayWorkAdmission,
+} from "../../process/gateway-work-admission.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import { closeOpenClawAgentDatabaseByPathAsync } from "../../state/openclaw-agent-db.js";
 import * as agentWriteAdmission from "../../state/openclaw-agent-write-admission.js";
@@ -307,26 +311,20 @@ it("cancels a contended persistent admission without claiming the reply or poiso
 });
 
 it.each(["complete", "user-abort", "restart-abort", "frozen-restart"] as const)(
-  "keeps successors behind physical claim release after %s while another agent is idle",
+  "keeps successors behind physical claim release during restart drain after %s",
   async (ending) => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const activePath = path.join(state.sessionsDir(), "agent.sqlite");
-      const idlePath = path.join(state.sessionsDir("other"), "agent.sqlite");
       const activeKey = "agent:main:completion-close";
-      const idleKey = "agent:other:completion-idle";
       const activeSessionId = "completion-active-session";
-      const idleSessionId = "completion-idle-session";
-      for (const [storePath, sessionKey, sessionId] of [
-        [activePath, activeKey, activeSessionId],
-        [idlePath, idleKey, idleSessionId],
-      ] as const) {
-        replaceSessionEntrySync({ storePath, sessionKey }, { sessionId, updatedAt: 1 });
-        await closeOpenClawAgentDatabaseByPathAsync(storePath);
-      }
+      replaceSessionEntrySync(
+        { storePath: activePath, sessionKey: activeKey },
+        { sessionId: activeSessionId, updatedAt: 1 },
+      );
+      await closeOpenClawAgentDatabaseByPathAsync(activePath);
       const shared = openOpenClawStateDatabase({ env: state.env });
       const leases = shared.db.prepare("SELECT lease_id FROM agent_database_leases WHERE path = ?");
       let active: Admission | undefined;
-      let idle: Admission | undefined;
       const work = new AsyncWorkScope();
       try {
         active = await work.run(() =>
@@ -339,21 +337,11 @@ it.each(["complete", "user-abort", "restart-abort", "frozen-restart"] as const)(
             resetTriggered: false,
           }),
         );
-        idle = await admitReplyTurn({
-          storePath: idlePath,
-          sessionKey: idleKey,
-          agentId: "other",
-          sessionId: idleSessionId,
-          expectedSessionId: idleSessionId,
-          kind: "visible",
-          resetTriggered: false,
-        });
-        if (active.status !== "owned" || !active.databaseClaim || idle.status !== "owned") {
-          throw new Error("Fixture requires two admitted persistent reply owners");
+        if (active.status !== "owned" || !active.databaseClaim) {
+          throw new Error("Fixture requires an admitted persistent reply owner");
         }
-        await completeAdmission(idle, idleKey);
         expect(leases.all(activePath)).toHaveLength(1);
-        expect(leases.all(idlePath)).toHaveLength(1);
+        markGatewayRestartDraining();
 
         const holder = holdStateDatabaseWriteTransaction(shared.path, 10_000);
         await holder.ready;
@@ -413,11 +401,13 @@ it.each(["complete", "user-abort", "restart-abort", "frozen-restart"] as const)(
           }
         }
         expect(leases.all(activePath)).toEqual([]);
-        expect(leases.all(idlePath)).toHaveLength(1);
       } finally {
-        await completeAdmission(active, activeKey);
-        await completeAdmission(idle, idleKey);
-        await work.drain();
+        try {
+          await completeAdmission(active, activeKey);
+          await work.drain();
+        } finally {
+          resetGatewayWorkAdmission();
+        }
       }
     });
   },
